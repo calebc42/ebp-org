@@ -17,8 +17,8 @@
 ;; the refusal vocabulary below is SPEC 14.4/14.5 wire.  Nothing here
 ;; builds a node, names a surface, or knows that a phone exists.  The
 ;; prefix is an ENFORCED claim rather than a spelling convention:
-;; test/run-tests.sh loads every `emacs/ebp*.el' file alone, in a
-;; process of its own, and fails if a `jetpacs' symbol — function,
+;; test/run-tests.sh loads this engine without an application layer and
+;; fails if a `jetpacs' symbol — function,
 ;; variable, face, error condition, group, or loaded feature — exists
 ;; afterwards.
 ;;
