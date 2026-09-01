@@ -497,6 +497,184 @@ on, pinned: symbol type to set, trailing remove-arg to clear."
          (goto-char (point-min))
          (should-not (search-forward "DEADLINE:" nil t)))))))
 
+;;;; Structural outline mutations
+
+(ert-deftest ebp-org-structural-insert-duplicate-and-delete ()
+  "Insertion returns live refs, duplication strips identities, and delete
+returns the exact revision removed."
+  (ebp-org-test--with-fixture f
+      "* Parent\n:PROPERTIES:\n:ID: parent-id\n:CUSTOM_ID: parent-custom\n:END:\n** Child\n:PROPERTIES:\n:ID: child-id\n:CUSTOM_ID: child-custom\n:END:\n* Tail\n"
+    (let* ((parent (ebp-org-test--ref-to f "Parent"))
+           (before-revision (ebp-org-subtree-revision parent))
+           (child-outcome
+            (ebp-org-insert-heading parent "structure" 'child "New child")))
+      (should (plist-get child-outcome :changed))
+      (should (equal (plist-get (plist-get child-outcome :ref) :headline)
+                     "New child"))
+      (should-not (equal before-revision
+                         (ebp-org-subtree-revision parent)))
+      (ebp-org-insert-heading parent "structure" 'before "Before parent")
+      (ebp-org-insert-heading parent "structure" 'after "After parent")
+      (with-current-buffer (find-file-noselect f)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (should (re-search-forward "^\\* Before parent$" nil t))
+         (should (re-search-forward "^\\* Parent$" nil t))
+         (should (re-search-forward "^\\*\\* New child$" nil t))
+         (should (re-search-forward "^\\* After parent$" nil t))))
+      (let* ((copy (ebp-org-duplicate-subtree parent "structure"))
+             (copy-ref (plist-get copy :ref))
+             (copy-revision (plist-get copy :revision)))
+        (should (equal (plist-get copy-ref :headline) "Parent"))
+        (let ((copy-marker (ebp-org-resolve-ref copy-ref)))
+          (unwind-protect
+              (with-current-buffer (marker-buffer copy-marker)
+                (org-with-wide-buffer
+                 (goto-char copy-marker)
+                 (should-not (org-entry-get nil "ID"))
+                 (should-not (org-entry-get nil "CUSTOM_ID"))
+                 (org-map-entries
+                  (lambda ()
+                    (should-not (org-entry-get nil "ID"))
+                    (should-not (org-entry-get nil "CUSTOM_ID")))
+                  nil 'tree)))
+            (set-marker copy-marker nil)))
+        (with-current-buffer (find-file-noselect f)
+          (org-with-wide-buffer
+           (goto-char (point-min))
+           (should (= 1 (how-many "^[ \\t]*:ID: parent-id$")))
+           (should (= 1 (how-many "^[ \\t]*:ID: child-id$")))
+           (should (= 1 (how-many "^[ \\t]*:CUSTOM_ID: parent-custom$")))
+           (should (= 1 (how-many "^[ \\t]*:CUSTOM_ID: child-custom$")))))
+        (should
+         (equal (plist-get (ebp-org-delete-subtree copy-ref "structure")
+                           :deleted-revision)
+                copy-revision))
+        (with-current-buffer (find-file-noselect f)
+          (org-with-wide-buffer
+           (goto-char (point-min))
+           (should (= 1 (how-many "^\\* Parent$")))))))))
+
+(ert-deftest ebp-org-structural-move-promote-and-demote ()
+  "Sibling movement and level changes delegate their boundary rules to Org."
+  (ebp-org-test--with-fixture f
+      "* A\n:PROPERTIES:\n:ID: a-id\n:END:\n* B\n:PROPERTIES:\n:ID: b-id\n:END:\n** C\n* D\n"
+    (let ((a (ebp-org-test--ref-to f "A"))
+          (b (ebp-org-test--ref-to f "B")))
+      (ebp-org-move-subtree b "structure" 'up)
+      (with-current-buffer (find-file-noselect f)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (should (looking-at-p "\\* B"))))
+      (ebp-org-move-subtree b "structure" 'down)
+      (ebp-org-demote-subtree b "structure")
+      (let ((marker (ebp-org-resolve-ref b)))
+        (unwind-protect
+            (with-current-buffer (marker-buffer marker)
+              (goto-char marker)
+              (should (= 2 (org-outline-level)))
+              (search-forward "C")
+              (org-back-to-heading t)
+              (should (= 3 (org-outline-level))))
+          (set-marker marker nil)))
+      (ebp-org-promote-subtree b "structure")
+      (let ((marker (ebp-org-resolve-ref b)))
+        (unwind-protect
+            (with-current-buffer (marker-buffer marker)
+              (goto-char marker)
+              (should (= 1 (org-outline-level))))
+          (set-marker marker nil)))
+      (should-error (ebp-org-move-subtree a "structure" 'up)
+                    :type 'user-error))))
+
+(ert-deftest ebp-org-transfer-is-private-identity-safe-and-destination-first ()
+  "Cross-file copy strips identities and move saves destination first."
+  (ebp-org-test--with-fixture source
+      "* Copy me\n:PROPERTIES:\n:ID: copy-id\n:CUSTOM_ID: copy-custom\n:END:\n** Nested\n:PROPERTIES:\n:ID: nested-id\n:END:\n* Move me\n:PROPERTIES:\n:ID: move-id\n:END:\n"
+    (let* ((target (expand-file-name "target.org"
+                                     (file-name-directory source)))
+           (copy-ref (ebp-org-test--ref-to source "Copy me"))
+           (move-ref (ebp-org-test--ref-to source "Move me"))
+           (save-order nil))
+      (unwind-protect
+          (progn
+            (write-region "* Target\n" nil target nil 'silent)
+            (let ((target-ref (ebp-org-test--ref-to target "Target"))
+                  (ebp-org-file-save-function
+                   (lambda (buffer)
+                     (setq save-order
+                           (append save-order
+                                   (list (file-name-nondirectory
+                                          (buffer-file-name buffer)))))
+                     (with-current-buffer buffer (save-buffer)))))
+              (let ((copy
+                     (ebp-org-transfer-subtree
+                      copy-ref (list :file target :parent target-ref)
+                      "structure" 'copy)))
+                (should (eq (plist-get copy :mode) 'copy))
+                (should-not (plist-get copy :pending-source-save)))
+              (with-current-buffer (find-file-noselect source)
+                (org-with-wide-buffer
+                 (goto-char (point-min))
+                 (should (search-forward ":ID: copy-id" nil t))))
+              (with-current-buffer (find-file-noselect target)
+                (org-with-wide-buffer
+                 (goto-char (point-min))
+                 (should (re-search-forward "^\\*\\* Copy me$" nil t))
+                 (goto-char (point-min))
+                 (should-not (search-forward ":ID: copy-id" nil t))
+                 (should-not (search-forward ":ID: nested-id" nil t))
+                 (should-not (search-forward ":CUSTOM_ID: copy-custom"
+                                             nil t))))
+              (setq save-order nil)
+              (let ((move
+                     (ebp-org-transfer-subtree
+                      move-ref (list :file target :parent target-ref)
+                      "structure" 'move)))
+                (should (eq (plist-get move :mode) 'move))
+                (should-not (plist-get move :pending-source-save)))
+              (should (equal save-order
+                             (list (file-name-nondirectory target)
+                                   (file-name-nondirectory source))))
+              (with-current-buffer (find-file-noselect source)
+                (org-with-wide-buffer
+                 (goto-char (point-min))
+                 (should-not (search-forward "Move me" nil t))))
+              (with-current-buffer (find-file-noselect target)
+                (org-with-wide-buffer
+                 (goto-char (point-min))
+                 (should (re-search-forward "^\\*\\* Move me$" nil t))
+                 (should (search-forward ":ID: move-id" nil t))))))
+        (when-let* ((buffer (find-buffer-visiting target)))
+          (with-current-buffer buffer (set-buffer-modified-p nil))
+          (kill-buffer buffer))
+        (when (file-exists-p target) (delete-file target))))))
+
+(ert-deftest ebp-org-transfer-refuses-a-destination-inside-source ()
+  "A move or copy cannot target a descendant of its own source tree."
+  (ebp-org-test--with-fixture f "* Parent\n** Child\n* Tail\n"
+    (let ((parent (ebp-org-test--ref-to f "Parent"))
+          (child (ebp-org-test--ref-to f "Child")))
+      (dolist (mode '(move copy))
+        (let ((err
+               (should-error
+                (ebp-org-transfer-subtree
+                 parent (list :file f :parent child) "structure" mode)
+                :type 'ebp-org-refused)))
+          (should (equal (cdr err) '(destination-inside-source))))))))
+
+(ert-deftest ebp-org-archive-checks-the-effective-target ()
+  "Archive destinations cannot escape the configured Org roots."
+  (ebp-org-test--with-fixture f "* Keep private\nBody\n"
+    (let ((ref (ebp-org-test--ref-to f "Keep private"))
+          (org-archive-location "/etc/ebp-org-archive::"))
+      (should-error (ebp-org-archive-subtree ref "structure")
+                    :type 'ebp-org-refused)
+      (with-current-buffer (find-file-noselect f)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (should (search-forward "Keep private" nil t)))))))
+
 ;;;; The deferred save
 
 (ert-deftest ebp-org-defer-save-debounces ()

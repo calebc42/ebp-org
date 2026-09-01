@@ -65,6 +65,7 @@
 (require 'org)
 (require 'org-id)                       ; org-id-locations / find-id-in-file
 (require 'org-capture)                  ; O3: templates, capture-run
+(require 'org-archive)                  ; prompt-free subtree archiving
 (require 'org-table)                    ; O3: org-table-current-begin-pos defvar
 ;; Batch 3 (P1-6): loaded EAGERLY, never lazily.  `org-timestamp-change'
 ;; autoloads org-clock (via `org-clock-update-time-maybe') in the middle
@@ -251,6 +252,30 @@ to the link's text."
     ((ebp-org-refused ebp-org-unresolved ebp-org-unavailable)
      nil)))
 
+(defun ebp-org--check-write-target (file)
+  "Return FILE's contained truename when it is a usable Org write target.
+Unlike `ebp-org--check-file', FILE may not exist yet.  The path must still
+be local and contained by `ebp-org-roots'; an existing file must be readable
+and writable, while an absent file must have a writable parent directory.
+Policy errors signal `ebp-org-refused' and transient filesystem availability
+errors signal `ebp-org-unavailable'."
+  (condition-case err
+      (let ((true (ebp-check-path file (ebp-org--roots) :require nil)))
+        (cond
+         ((file-exists-p true)
+          (unless (and (file-readable-p true) (file-writable-p true))
+            (signal 'ebp-org-unavailable (list 'unwritable)))
+          true)
+         ((not (file-accessible-directory-p (file-name-directory true)))
+          (signal 'ebp-org-unavailable (list 'parent-unavailable)))
+         ((not (file-writable-p (file-name-directory true)))
+          (signal 'ebp-org-unavailable (list 'unwritable)))
+         (t true)))
+    (ebp-path-refused
+     (if (eq (cadr err) 'no-roots)
+         (signal 'ebp-org-unavailable (cdr err))
+       (signal 'ebp-org-refused (cdr err))))))
+
 ;;;; The D2 IO clamp
 
 (defmacro ebp-org--with-clamped-io (&rest body)
@@ -289,6 +314,14 @@ between the existence filter and the map — the filter/prepare race)."
                 (lambda (&rest _)
                   (signal 'ebp-org-refused (list 'needs-interactive)))))
        ,@body)))
+
+(defun ebp-org-call-with-clamped-io (function &rest arguments)
+  "Call FUNCTION with ARGUMENTS under the engine's no-prompt IO clamp.
+This is the public functional form for a higher layer that must combine a
+prompt-free Org operation with its own session state.  Interactive file IO
+is converted to the same `ebp-org-refused' conditions as engine mutations."
+  (ebp-org--with-clamped-io
+    (apply function arguments)))
 
 ;;;; Cache layer
 
@@ -846,6 +879,297 @@ save happen once, after the pair has been committed."
           (when deadline-repeater
             (ebp-org-set-repeater "DEADLINE" deadline-repeater))))
       (list :scheduled scheduled :deadline deadline))))
+
+;;;; Structural outline mutations
+
+(defvar ebp-org-file-save-function)
+
+(defun ebp-org--subtree-bounds-at-point ()
+  "Return the current Org subtree's (BEGIN . END) buffer positions."
+  (org-back-to-heading t)
+  (cons (point) (save-excursion (org-end-of-subtree t t) (point))))
+
+(defun ebp-org--subtree-revision-at-point ()
+  "Return a SHA-256 revision for the current Org subtree."
+  (pcase-let ((`(,beg . ,end) (ebp-org--subtree-bounds-at-point)))
+    (secure-hash 'sha256 (current-buffer) beg end)))
+
+(defun ebp-org--subtree-outcome (&optional changed)
+  "Return an explicit structural outcome for the subtree at point.
+CHANGED defaults to t and becomes the outcome's `:changed' member."
+  (list :changed (if (null changed) t changed)
+        :ref (ebp-org-ref-at-point)
+        :revision (ebp-org--subtree-revision-at-point)))
+
+(defun ebp-org-subtree-revision (ref)
+  "Return the live subtree revision for Org heading REF."
+  (ebp-org--with-clamped-io
+    (let ((marker (ebp-org-resolve-ref ref)))
+      (unwind-protect
+          (with-current-buffer (marker-buffer marker)
+            (org-with-wide-buffer
+             (goto-char marker)
+             (ebp-org--subtree-revision-at-point)))
+        (set-marker marker nil)))))
+
+(defun ebp-org--clean-heading-title (title)
+  "Return TITLE as one bounded Org heading line, or signal."
+  (unless (stringp title)
+    (user-error "Heading title must be a string"))
+  (let ((clean (string-trim
+                (replace-regexp-in-string "[\n\r]+" " " title))))
+    (when (string-blank-p clean)
+      (user-error "Heading title cannot be empty"))
+    (when (> (length clean) 512)
+      (user-error "Heading title exceeds 512 characters"))
+    clean))
+
+(defun ebp-org-insert-heading (ref namespace relation title)
+  "Insert TITLE relative to heading REF and return its structural outcome.
+RELATION is `before', `after', or `child'.  NAMESPACE selects the cache
+partition invalidated by the mutation.  The operation never reads a prompt."
+  (let ((title (ebp-org--clean-heading-title title)))
+    (unless (memq relation '(before after child))
+      (user-error "Unsupported heading relation: %S" relation))
+    (ebp-org-with-mutation ref namespace
+      (atomic-change-group
+        (org-back-to-heading t)
+        (let* ((level (org-outline-level))
+               (insert-level
+                (if (eq relation 'child)
+                    (org-get-valid-level level 1)
+                  level)))
+          (pcase relation
+            ('before nil)
+            ((or 'after 'child) (org-end-of-subtree t t)))
+          (unless (bolp) (insert "\n"))
+          (let ((start (point)))
+            (insert (make-string insert-level ?*) " " title "\n")
+            (goto-char start)
+            (ebp-org--subtree-outcome)))))))
+
+(defun ebp-org-move-subtree (ref namespace direction)
+  "Move REF one sibling in DIRECTION and return its structural outcome.
+DIRECTION is `up' or `down'.  NAMESPACE selects the invalidated cache
+partition.  Org rejects movement across a parent or buffer boundary."
+  (unless (memq direction '(up down))
+    (user-error "Unsupported subtree direction: %S" direction))
+  (ebp-org-with-mutation ref namespace
+    (atomic-change-group
+      (pcase direction
+        ('up (org-move-subtree-up 1))
+        ('down (org-move-subtree-down 1)))
+      (org-back-to-heading t)
+      (ebp-org--subtree-outcome))))
+
+(defun ebp-org-promote-subtree (ref namespace)
+  "Promote heading REF and its descendants, invalidating NAMESPACE."
+  (ebp-org-with-mutation ref namespace
+    (atomic-change-group
+      (org-promote-subtree)
+      (org-back-to-heading t)
+      (ebp-org--subtree-outcome))))
+
+(defun ebp-org-demote-subtree (ref namespace)
+  "Demote heading REF and its descendants, invalidating NAMESPACE."
+  (ebp-org-with-mutation ref namespace
+    (atomic-change-group
+      (org-demote-subtree)
+      (org-back-to-heading t)
+      (ebp-org--subtree-outcome))))
+
+(defun ebp-org--copy-without-identities (text)
+  "Return Org subtree TEXT without ID or CUSTOM_ID properties.
+The copy is parsed in a temporary Org buffer so body text that merely looks
+like a property is not rewritten."
+  (with-temp-buffer
+    (let ((org-mode-hook nil)
+          (org-inhibit-startup t))
+      (org-mode))
+    (insert text)
+    (goto-char (point-min))
+    (org-map-entries
+     (lambda ()
+       (org-entry-delete (point) "ID")
+       (org-entry-delete (point) "CUSTOM_ID"))
+     nil nil)
+    (buffer-string)))
+
+(defun ebp-org-duplicate-subtree (ref namespace)
+  "Duplicate REF after itself without copying Org identities.
+NAMESPACE selects the invalidated cache partition.  The returned outcome
+identifies the new copy; neither the kill ring nor `org-subtree-clip' is used."
+  (ebp-org-with-mutation ref namespace
+    (atomic-change-group
+      (pcase-let* ((`(,beg . ,end) (ebp-org--subtree-bounds-at-point))
+                   (text (ebp-org--copy-without-identities
+                          (buffer-substring-no-properties beg end))))
+        (goto-char end)
+        (unless (bolp) (insert "\n"))
+        (let ((start (point)))
+          (insert text)
+          (unless (bolp) (insert "\n"))
+          (goto-char start)
+          (ebp-org--subtree-outcome))))))
+
+(defun ebp-org-delete-subtree (ref namespace)
+  "Delete heading REF and its descendants, invalidating NAMESPACE.
+Return an explicit outcome containing the revision that was removed."
+  (ebp-org-with-mutation ref namespace
+    (atomic-change-group
+      (let* ((bounds (ebp-org--subtree-bounds-at-point))
+             (revision (secure-hash 'sha256 (current-buffer)
+                                    (car bounds) (cdr bounds))))
+        (delete-region (car bounds) (cdr bounds))
+        (list :changed t :deleted-revision revision)))))
+
+(defun ebp-org-archive-subtree (ref namespace)
+  "Archive heading REF through Org, invalidating NAMESPACE.
+The effective archive path is containment-checked before Org can create or
+open it.  Org performs its normal context bookkeeping and saves the archive
+file; the source follows the engine's ordinary save policy."
+  (ebp-org-with-mutation ref namespace
+    (let* ((revision (ebp-org--subtree-revision-at-point))
+           (location
+            (org-archive--compute-location
+             (or (org-entry-get nil "ARCHIVE" 'inherit)
+                 org-archive-location))))
+      (ebp-org--check-write-target (car location))
+      (let ((org-archive-subtree-save-file-p t))
+        (org-archive-subtree))
+      (list :changed t :archived-revision revision))))
+
+(defun ebp-org--transfer-target (destination)
+  "Resolve private transfer DESTINATION to (BUFFER PARENT-MARKER FILE)."
+  (unless (and (plistp destination)
+               (stringp (plist-get destination :file)))
+    (user-error "Transfer destination must name a file"))
+  (let* ((file (ebp-org--check-write-target
+                (plist-get destination :file)))
+         (buffer (find-file-noselect file t))
+         (parent-ref (plist-get destination :parent))
+         (parent (and parent-ref (ebp-org-resolve-ref parent-ref))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'org-mode) (org-mode)))
+    (when parent
+      (unless (eq (marker-buffer parent) buffer)
+        (set-marker parent nil)
+        (signal 'ebp-org-refused (list 'destination-mismatch))))
+    (list buffer parent file)))
+
+(defun ebp-org--transfer-insertion (buffer parent)
+  "In BUFFER, move to PARENT's child insertion point and return its level.
+When PARENT is nil, move to the file end and return top level."
+  (with-current-buffer buffer
+    (org-with-wide-buffer
+     (if (null parent)
+         (progn (goto-char (point-max)) 1)
+       (goto-char parent)
+       (org-back-to-heading t)
+       (let ((level (org-get-valid-level (org-outline-level) 1)))
+         (goto-char
+          (if (org-notes-order-reversed-p)
+              (or (outline-next-heading) (point-max))
+            (or (save-excursion (org-get-next-sibling))
+                (org-end-of-subtree t t)
+                (point-max))))
+         level)))))
+
+(defun ebp-org-transfer-subtree (ref destination namespace mode)
+  "Transfer REF to private DESTINATION using MODE and return an outcome.
+DESTINATION is `(:file FILE :parent REF-OR-NIL)'; nil parent means the file's
+top level.  MODE is `move' or `copy'.  Copies recursively discard ID and
+CUSTOM_ID, while moves retain Org identities and tracked markers.  A target
+inside the source subtree is always rejected.
+
+Both buffers participate in one in-memory change group.  The configured
+`ebp-org-file-save-function' runs destination-first and then source, so a
+cross-file source-save failure can leave a duplicate but cannot lose the
+subtree.  Such a completed transfer returns `:pending-source-save' and arms
+the engine's deferred source save instead of inviting an unsafe replay."
+  (unless (memq mode '(move copy))
+    (user-error "Transfer mode must be move or copy"))
+  (ebp-org--with-clamped-io
+    (let ((source-marker (ebp-org-resolve-ref ref))
+          target parent source-beg source-end new-marker handle
+          activated finished pending-source-save)
+      (unwind-protect
+          (progn
+            (pcase-let ((`(,target-buffer ,parent-marker ,_file)
+                         (ebp-org--transfer-target destination)))
+              (setq target target-buffer
+                    parent parent-marker))
+            (let ((source (marker-buffer source-marker)))
+              (with-current-buffer source
+                (org-with-wide-buffer
+                 (goto-char source-marker)
+                 (pcase-let ((`(,beg . ,end)
+                              (ebp-org--subtree-bounds-at-point)))
+                   (setq source-beg (copy-marker beg)
+                         source-end (copy-marker end)))))
+              (when (and parent (eq source target)
+                         (<= (marker-position source-beg)
+                             (marker-position parent))
+                         (< (marker-position parent)
+                            (marker-position source-end)))
+                (signal 'ebp-org-refused (list 'destination-inside-source)))
+              (setq handle (prepare-change-group target))
+              (unless (eq source target)
+                (setq handle
+                      (nconc handle (prepare-change-group source))))
+              (activate-change-group handle)
+              (setq activated t)
+              (let ((org-markers-to-move nil)
+                    (text
+                     (with-current-buffer source
+                       (buffer-substring-no-properties
+                        source-beg source-end))))
+                (when (eq mode 'copy)
+                  (setq text (ebp-org--copy-without-identities text)))
+                (when (eq mode 'move)
+                  (with-current-buffer source
+                    (org-save-markers-in-region source-beg source-end)))
+                (let ((level (ebp-org--transfer-insertion target parent)))
+                  (with-current-buffer target
+                    (org-with-wide-buffer
+                     (unless (bolp) (insert "\n"))
+                     (org-paste-subtree level text)
+                     (org-back-to-heading t)
+                     (setq new-marker (copy-marker (point))))))
+                (when (eq mode 'move)
+                  (with-current-buffer source
+                    (org-with-wide-buffer
+                     (delete-region source-beg source-end)))))
+              (if (eq source target)
+                  (with-current-buffer target
+                    (funcall ebp-org-file-save-function target))
+                (with-current-buffer target
+                  (funcall ebp-org-file-save-function target))
+                (when (eq mode 'move)
+                  (condition-case nil
+                      (with-current-buffer source
+                        (funcall ebp-org-file-save-function source))
+                    (error
+                     (setq pending-source-save t)
+                     (with-current-buffer source (ebp-org-defer-save))
+                     (message "ebp-org: source save pending after transfer")))))
+              (accept-change-group handle)
+              (setq finished t)
+              (ebp-org-cache-invalidate namespace)
+              (with-current-buffer target
+                (org-with-wide-buffer
+                 (goto-char new-marker)
+                 (let ((outcome (ebp-org--subtree-outcome)))
+                   (setq outcome (plist-put outcome :mode mode))
+                   (when pending-source-save
+                     (setq outcome
+                           (plist-put outcome :pending-source-save t)))
+                   outcome)))))
+        (when (and activated (not finished))
+          (cancel-change-group handle))
+        (dolist (marker (list source-marker source-beg source-end
+                              new-marker parent))
+          (when (markerp marker) (set-marker marker nil)))))))
 
 ;;;; Typed extraction
 
