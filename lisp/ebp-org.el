@@ -808,6 +808,45 @@ this is undocumented org behavior we depend on)."
           (org-add-planning-info nil nil type)
         (org-add-planning-info type date-str)))))
 
+(defun ebp-org-set-planning-pair (ref namespace scheduled deadline)
+  "Atomically replace REF's SCHEDULED and DEADLINE planning stamps.
+SCHEDULED and DEADLINE are full Org timestamp strings, or nil/empty to
+remove that field.  Both values are validated before REF is resolved, and
+both buffer edits live in one `atomic-change-group': a failure applying the
+second stamp rolls the first one back.  Cache invalidation and the deferred
+save happen once, after the pair has been committed."
+  (dolist (value (list scheduled deadline))
+    (unless (or (null value) (stringp value))
+      (user-error "Planning values must be timestamp strings or nil")))
+  (let ((scheduled-repeater
+         (and (stringp scheduled)
+              (string-match
+               "[ \t]\\([.+]?\\+[0-9]+[hdwmy]\\)\\(?:[ \t]\\|[]>]\\)"
+               scheduled)
+              (match-string 1 scheduled)))
+        (deadline-repeater
+         (and (stringp deadline)
+              (string-match
+               "[ \t]\\([.+]?\\+[0-9]+[hdwmy]\\)\\(?:[ \t]\\|[]>]\\)"
+               deadline)
+              (match-string 1 deadline))))
+    (ebp-org-with-mutation ref namespace
+      (atomic-change-group
+        (if (or (null scheduled) (string-empty-p scheduled))
+            (org-add-planning-info nil nil 'scheduled)
+          (org-add-planning-info 'scheduled scheduled)
+          ;; `org-add-planning-info' normalizes away repeater cookies even
+          ;; though it accepts the full timestamp.  Restore the caller's
+          ;; explicit cookie inside the same atomic change group.
+          (when scheduled-repeater
+            (ebp-org-set-repeater "SCHEDULED" scheduled-repeater)))
+        (if (or (null deadline) (string-empty-p deadline))
+            (org-add-planning-info nil nil 'deadline)
+          (org-add-planning-info 'deadline deadline)
+          (when deadline-repeater
+            (ebp-org-set-repeater "DEADLINE" deadline-repeater))))
+      (list :scheduled scheduled :deadline deadline))))
+
 ;;;; Typed extraction
 
 (defun ebp-org-entry-typed-value (prop type)

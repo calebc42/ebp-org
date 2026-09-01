@@ -449,6 +449,54 @@ on, pinned: symbol type to set, trailing remove-arg to clear."
          (goto-char (point-min))
          (should-not (search-forward "SCHEDULED:" nil t)))))))
 
+(ert-deftest ebp-org-set-planning-pair-is-one-atomic-mutation ()
+  "The pair setter commits both stamps and invalidates/saves only once."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (let ((ref (ebp-org-test--ref-to f "First heading"))
+          (invalidations 0)
+          (saves 0))
+      (cl-letf (((symbol-function 'ebp-org-cache-invalidate)
+                 (lambda (&optional _namespace) (cl-incf invalidations)))
+                ((symbol-function 'ebp-org-defer-save)
+                 (lambda () (cl-incf saves))))
+        (should
+         (equal
+          (ebp-org-set-planning-pair
+           ref "ja4t" "<2026-09-02 Wed 09:30 +1w>" "<2026-09-04 Fri>")
+          '(:scheduled "<2026-09-02 Wed 09:30 +1w>"
+            :deadline "<2026-09-04 Fri>"))))
+      (should (= invalidations 1))
+      (should (= saves 1))
+      (with-current-buffer (find-file-noselect f)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (should (equal (org-entry-get (point) "SCHEDULED")
+                        "<2026-09-02 Wed 09:30 +1w>"))
+         (should (equal (org-entry-get (point) "DEADLINE")
+                        "<2026-09-04 Fri>")))))))
+
+(ert-deftest ebp-org-set-planning-pair-rolls-back-second-write-failure ()
+  "A deadline failure cannot leave the scheduled half applied."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (let* ((ref (ebp-org-test--ref-to f "First heading"))
+           (real (symbol-function 'org-add-planning-info))
+           (calls 0))
+      (should-error
+       (cl-letf (((symbol-function 'org-add-planning-info)
+                  (lambda (&rest args)
+                    (cl-incf calls)
+                    (if (= calls 2)
+                        (error "second planning write failed")
+                      (apply real args)))))
+         (ebp-org-set-planning-pair
+          ref "ja4t" "<2026-09-02 Wed>" "<2026-09-04 Fri>")))
+      (with-current-buffer (find-file-noselect f)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (should-not (search-forward "SCHEDULED:" nil t))
+         (goto-char (point-min))
+         (should-not (search-forward "DEADLINE:" nil t)))))))
+
 ;;;; The deferred save
 
 (ert-deftest ebp-org-defer-save-debounces ()
