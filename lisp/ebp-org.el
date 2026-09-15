@@ -1709,6 +1709,130 @@ Repeaters only — delay cookies (-1d) deliberately do not match."
             (save-excursion (goto-char org-clock-hd-marker)
                             (line-beginning-position))))))
 
+;; Tag groups: the buffer vocabulary and a heading's effective membership.
+;; Org keeps two buffer-local tables.  `org-tag-groups-alist' is
+;; (GROUPTAG MEMBER...) in declaration order but forgets whether a group
+;; opened with `:startgroup' (mutually exclusive, "{}") or
+;; `:startgrouptag' ("[]"), and drops unnamed sets; the richer
+;; `org-current-tag-alist' keeps both, so the walker reads that one.
+;; Nothing here is memoised on purpose: `ebp-org-with-cache' stamps the
+;; date, agenda mtimes and buffer ticks, not `org-tag-alist',
+;; `org-tag-persistent-alist' or the inheritance settings, so a cache
+;; would serve stale groups after a settings write.  The work is one
+;; `org-get-tags' plus a walk over a short alist.
+
+(defconst ebp-org--tag-regexp-member-re "\\`{.*}\\'"
+  "A tag-alist member Org treats as a regexp, never a tag a heading has.")
+
+(defun ebp-org--tag-alist-name (entry)
+  "Return the tag name of tag-alist ENTRY, or nil for a structural one.
+Org writes (TAG) and (TAG . KEY); a hand-written alist may hold a bare
+string.  Regexp members answer nil too."
+  (let ((name (cond ((stringp entry) entry)
+                    ((and (consp entry) (stringp (car entry))) (car entry)))))
+    (and name
+         (not (string-match-p ebp-org--tag-regexp-member-re name))
+         (substring-no-properties name))))
+
+(defun ebp-org--tag-group-specs ()
+  "Walk `org-current-tag-alist' into group plists in declaration order.
+Each is (:name NAME :exclusive BOOL :tags MEMBERS).  NAME is the group
+tag, or nil for an unnamed exclusive set such as \"{ home work }\";
+MEMBERS are the declared tags after the `:grouptags' marker (the whole
+set for an unnamed one), deduplicated, regexp members skipped.  The
+group tag is not its own member.  Groups without members are dropped."
+  (let (groups kind name members)
+    (cl-flet ((flush ()
+                (when (and kind members)
+                  (push (list :name name
+                              :exclusive (eq kind 'exclusive)
+                              :tags (nreverse members))
+                        groups))
+                (setq kind nil name nil members nil)))
+      (dolist (entry org-current-tag-alist)
+        (pcase (car-safe entry)
+          (:startgroup (flush) (setq kind 'exclusive))
+          (:startgrouptag (flush) (setq kind 'plain))
+          ((or :endgroup :endgrouptag) (flush))
+          (:grouptags
+           ;; Org takes the tag just before the marker as the group tag.
+           (when kind
+             (setq name (car members) members nil)))
+          (_
+           (when kind
+             (when-let* ((tag (ebp-org--tag-alist-name entry)))
+               (unless (member tag members)
+                 (push tag members)))))))
+      (flush))
+    (nreverse groups)))
+
+(defun ebp-org-tag-groups ()
+  "Return the current buffer's tag groups in declaration order.
+Each element is (:name NAME :exclusive BOOL :tags MEMBERS): NAME is the
+group tag or nil for an unnamed exclusive set, EXCLUSIVE whether Org
+declared it with braces, MEMBERS its declared tags without the group tag
+itself.  Persistent-alist groups come first, then the buffer's own
+`#+TAGS' or the global alist, as Org merges them.  Every string is a
+fresh propertyless copy.  Nil outside `org-mode'.  Never signals."
+  (when (derived-mode-p 'org-mode)
+    (ebp-org--tag-group-specs)))
+
+(defun ebp-org-tag-groups-at (pos)
+  "Return the effective tag-group membership of the heading at POS.
+POS is a position in the current buffer.  The result is a plist:
+:tags every effective tag in `org-get-tags' order (file tags, then
+inherited, then local; the most local copy wins); :local the tags set
+on the heading itself; :inherited those carrying Org's `inherited'
+property; :loose the effective tags that belong to no group; :groups
+one plist per `ebp-org-tag-groups' entry, in declaration order, with
+:members (the effective tags declared in it, in group order) and its
+own :local and :inherited split.  Membership honors
+`org-use-tag-inheritance', `org-tags-exclude-from-inheritance' and
+`#+FILETAGS'; a tag may belong to several groups.  Every string is a
+fresh propertyless copy.  Nil outside `org-mode'."
+  (when (derived-mode-p 'org-mode)
+    (let* ((raw (save-excursion (ignore-errors (org-get-tags pos))))
+           (inherited-p (lambda (tag) (get-text-property 0 'inherited tag)))
+           (tags (mapcar #'substring-no-properties raw))
+           (local (mapcar #'substring-no-properties
+                          (cl-remove-if inherited-p raw)))
+           (inherited (mapcar #'substring-no-properties
+                              (cl-remove-if-not inherited-p raw)))
+           (groups
+            (mapcar
+             (lambda (spec)
+               (let ((members (cl-remove-if-not
+                               (lambda (tag) (member tag tags))
+                               (plist-get spec :tags))))
+                 (append spec
+                         (list :members members
+                               :local (cl-remove-if-not
+                                       (lambda (tag) (member tag local))
+                                       members)
+                               :inherited (cl-remove-if-not
+                                           (lambda (tag) (member tag inherited))
+                                           members)))))
+             (ebp-org--tag-group-specs)))
+           (grouped (apply #'append
+                           (mapcar (lambda (group) (plist-get group :tags))
+                                   groups)))
+           (loose (cl-remove-if (lambda (tag) (member tag grouped)) tags)))
+      (list :tags tags :local local :inherited inherited
+            :loose loose :groups groups))))
+
+(defun ebp-org-heading-tag-groups (ref)
+  "Return `ebp-org-tag-groups-at' for Org heading REF.
+Resolves REF under the IO clamp and releases its marker; signals
+`ebp-org-refused', `ebp-org-unresolved' or `ebp-org-unavailable' exactly
+as `ebp-org-resolve-ref' does."
+  (ebp-org--with-clamped-io
+    (let ((marker (ebp-org-resolve-ref ref)))
+      (unwind-protect
+          (with-current-buffer (marker-buffer marker)
+            (org-with-wide-buffer
+             (ebp-org-tag-groups-at (marker-position marker))))
+        (set-marker marker nil)))))
+
 ;;;; Headless capture
 ;; D-5 (reversed): `ebp-org-capture-run' is the SUBSTRATE the
 ;; rescheduled template-builder rung will stand on — the API here is a

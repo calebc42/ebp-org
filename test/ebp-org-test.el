@@ -1361,6 +1361,161 @@ user data (SPEC 23.3), so no leaf of the tree may ride in the message."
   (should-not (ebp-org-ts-repeater "<2026-08-01 Sat -1d>"))
   (should-not (ebp-org-ts-date nil)))
 
+(defconst ebp-org-test--tag-group-fixture
+  (concat "#+TAGS: { state : hot cold } [ proj : alpha beta ] "
+          "[ shared : beta gamma ] { solo duo } [ rx : {V@.+} vee ] loose\n"
+          "#+FILETAGS: :alpha:\n"
+          "* Parent :hot:\n"
+          "** Child :beta:extra:\n"
+          "* Bare\n")
+  "Every group kind: exclusive named, plain named, a tag in two groups,
+an unnamed exclusive set, a regexp member, an ungrouped vocabulary tag,
+a file tag, and an inherited exclusive member.")
+
+(defun ebp-org-test--tag-groups-at (file headline)
+  "FILE's `ebp-org-tag-groups-at' for the heading titled HEADLINE."
+  (with-current-buffer (find-file-noselect file)
+    (org-mode)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (search-forward (concat "* " headline))
+     (ebp-org-tag-groups-at (line-beginning-position)))))
+
+(defun ebp-org-test--group (result name)
+  "The :groups entry of RESULT named NAME (`equal', so nil works)."
+  (seq-find (lambda (group) (equal (plist-get group :name) name))
+            (plist-get result :groups)))
+
+(ert-deftest ebp-org-tag-groups-read-buffer-vocabulary ()
+  "Groups keep declaration order, exclusivity and unnamed sets; regexp
+members and ungrouped tags never become members."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (with-current-buffer (find-file-noselect f)
+      (org-mode)
+      (let ((groups (ebp-org-tag-groups)))
+        (should (equal (mapcar (lambda (g) (plist-get g :name)) groups)
+                       '("state" "proj" "shared" nil "rx")))
+        (should (equal (mapcar (lambda (g) (plist-get g :exclusive)) groups)
+                       '(t nil nil t nil)))
+        (should (equal (plist-get (nth 0 groups) :tags) '("hot" "cold")))
+        (should (equal (plist-get (nth 3 groups) :tags) '("solo" "duo")))
+        (should (equal (plist-get (nth 4 groups) :tags) '("vee")))
+        (should-not (seq-find (lambda (g) (member "loose" (plist-get g :tags)))
+                              groups))))))
+
+(ert-deftest ebp-org-tag-groups-honor-persistent-alist ()
+  "A persistent-alist group is merged ahead of the buffer's own groups."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (with-current-buffer (find-file-noselect f)
+      (let ((org-tag-persistent-alist
+             '((:startgrouptag) ("pers") (:grouptags) ("p1") ("p2")
+               (:endgrouptag))))
+        (org-mode)
+        (let ((first (car (ebp-org-tag-groups))))
+          (should (equal (plist-get first :name) "pers"))
+          (should-not (plist-get first :exclusive))
+          (should (equal (plist-get first :tags) '("p1" "p2")))
+          (should (equal (plist-get (cadr (ebp-org-tag-groups)) :name)
+                         "state")))))))
+
+(ert-deftest ebp-org-tag-groups-at-splits-local-and-inherited ()
+  "Effective tags partition into local, inherited and loose, and each
+group reports the same split over its declared members."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let ((child (ebp-org-test--tag-groups-at f "Child")))
+      (should (equal (plist-get child :tags) '("alpha" "hot" "beta" "extra")))
+      (should (equal (plist-get child :local) '("beta" "extra")))
+      (should (equal (plist-get child :inherited) '("alpha" "hot")))
+      (should (equal (plist-get child :loose) '("extra")))
+      (let ((state (ebp-org-test--group child "state"))
+            (proj (ebp-org-test--group child "proj")))
+        (should (equal (plist-get state :members) '("hot")))
+        (should-not (plist-get state :local))
+        (should (equal (plist-get state :inherited) '("hot")))
+        (should (equal (plist-get proj :members) '("alpha" "beta")))
+        (should (equal (plist-get proj :local) '("beta")))
+        (should (equal (plist-get proj :inherited) '("alpha")))))
+    (let ((bare (ebp-org-test--tag-groups-at f "Bare")))
+      (should (equal (plist-get bare :inherited) '("alpha")))
+      (should-not (plist-get bare :local))
+      (should-not (plist-get bare :loose))
+      (should-not (plist-get (ebp-org-test--group bare "state") :members))
+      (should (equal (plist-get (ebp-org-test--group bare "proj") :members)
+                     '("alpha"))))))
+
+(ert-deftest ebp-org-tag-groups-at-tag-in-two-groups ()
+  "Org lets a tag sit in several groups; it is a member of each and
+never loose."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let ((child (ebp-org-test--tag-groups-at f "Child")))
+      (should (member "beta" (plist-get (ebp-org-test--group child "proj")
+                                        :members)))
+      (should (member "beta" (plist-get (ebp-org-test--group child "shared")
+                                        :members)))
+      (should-not (member "beta" (plist-get child :loose))))))
+
+(ert-deftest ebp-org-tag-groups-at-honors-inheritance-settings ()
+  "The query is Org's inheritance policy, not its own."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let* ((org-use-tag-inheritance nil)
+           (child (ebp-org-test--tag-groups-at f "Child")))
+      (should-not (plist-get child :inherited))
+      (should (equal (plist-get child :tags) '("beta" "extra")))
+      (should (equal (plist-get (ebp-org-test--group child "proj") :members)
+                     '("beta")))
+      (should-not (plist-get (ebp-org-test--group child "state") :members)))
+    (let* ((org-tags-exclude-from-inheritance '("hot"))
+           (child (ebp-org-test--tag-groups-at f "Child")))
+      (should-not (plist-get (ebp-org-test--group child "state") :members))
+      (should (equal (plist-get (ebp-org-test--group child "proj") :members)
+                     '("alpha" "beta"))))))
+
+(ert-deftest ebp-org-tag-groups-at-strings-are-propertyless ()
+  "Org marks inherited tags with a text property; nothing leaves with it."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let ((child (ebp-org-test--tag-groups-at f "Child")))
+      (should-not (text-properties-at 0 (car (plist-get child :inherited))))
+      (should (equal-including-properties (plist-get child :inherited)
+                                          '("alpha" "hot")))
+      (should (equal-including-properties
+               (plist-get (ebp-org-test--group child "state") :members)
+               '("hot")))
+      (should (equal-including-properties
+               (plist-get (ebp-org-test--group child "state") :tags)
+               '("hot" "cold"))))))
+
+(ert-deftest ebp-org-heading-tag-groups-resolves-ref ()
+  "The ref entry point answers exactly what the position primitive does."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let ((ref (with-current-buffer (find-file-noselect f)
+                 (org-mode)
+                 (org-with-wide-buffer
+                  (goto-char (point-min))
+                  (search-forward "* Child")
+                  (ebp-org-ref-at-point)))))
+      (should (equal (ebp-org-heading-tag-groups ref)
+                     (ebp-org-test--tag-groups-at f "Child"))))))
+
+(ert-deftest ebp-org-heading-tag-groups-refuses-outside-roots ()
+  "A ref outside `ebp-org-roots' is refused with a bare reason symbol."
+  (ebp-org-test--with-fixture f ebp-org-test--tag-group-fixture
+    (let ((ebp-org-roots (list (file-truename
+                                (make-temp-file "ja4-other" t)))))
+      (let ((err (condition-case err
+                     (progn (ebp-org-heading-tag-groups
+                             (list :id nil :file f :pos 1 :headline ""))
+                            nil)
+                   (ebp-org-refused err))))
+        (should (eq (car err) 'ebp-org-refused))
+        (should (symbolp (cadr err)))))))
+
+(ert-deftest ebp-org-tag-groups-degrade-outside-org-mode ()
+  "Both buffer readers answer nil rather than reading foreign state."
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-not (ebp-org-tag-groups))
+    (should-not (ebp-org-tag-groups-at 1))))
+
 (ert-deftest ebp-org-capture-prompts-schema ()
   "Exit-gate: the ONE extractor (D-5 dedupe) — %? adds Headline,
 defaults drop from labels, duplicates collapse."
