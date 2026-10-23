@@ -1590,9 +1590,10 @@ the user's query for a bug in the calling code."
   "Non-nil when the org entry at point matches query sexp TREE."
   (ebp-org-matches-p tree #'ebp-org--point-get))
 
-;; The vulpea note-index arm lives in jetpacs-org-vulpea.el (Tier-1
-;; staging, NEVER required by base): base is vanilla Emacs, vulpea is
-;; not built-in.  Base keeps only the seam it plugs into — the
+;; The vulpea note-index arm lives in the Glasspane app
+;; (glasspane-vulpea.el, NEVER required by base): base is vanilla
+;; Emacs, vulpea is not built-in.  Base keeps only the seam it plugs
+;; into — the
 ;; accessor-pluggable `ebp-org-matches-p' above.  The accessor is
 ;; the extension point; `ebp-org--point-get' stays PRIVATE behind
 ;; the public `ebp-org-entry-matches-p', because reading the entry
