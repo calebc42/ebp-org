@@ -689,6 +689,23 @@ returns the exact revision removed."
                                      #'ebp-org--save-now))
                     timer-idle-list))))))
 
+(ert-deftest ebp-org-defer-save-consults-the-guard ()
+  "A guard that signals refuses the save before any timer is armed; one
+that returns lets it through."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (with-current-buffer (find-file-noselect f)
+      (let ((calls 0))
+        (let ((ebp-org-save-guard-function
+               (lambda () (cl-incf calls) (error "Refused"))))
+          (should-error (ebp-org-defer-save))
+          (should-not (timerp ebp-org--save-timer)))
+        (let ((ebp-org-save-guard-function (lambda () (cl-incf calls))))
+          (ebp-org-defer-save)
+          (should (timerp ebp-org--save-timer)))
+        (should (= calls 2))
+        (cancel-timer ebp-org--save-timer)
+        (setq ebp-org--save-timer nil)))))
+
 (ert-deftest ebp-org-defer-save-refuses-superseded-file ()
   "Defect 3: the save body must refuse a superseded file rather than
 reach `basic-save-buffer's `yes-or-no-p' — a prompt in a timer wedges a

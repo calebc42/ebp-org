@@ -745,8 +745,18 @@ process" (buffer-name buf)))
                (message "ebp-org: NOT saving %s — needs interactive \
 input" (buffer-name buf))))))))))
 
+(defvar ebp-org-save-guard-function nil
+  "Nullary function consulted before `ebp-org-defer-save' arms a save.
+It signals to refuse the save, or returns to allow it.  A host
+installs one to refuse saves from extents where writing is a bug (a
+render that must stay pure); the engine names no host symbol, so the
+guard is a seam rather than a check of its own.")
+
 (defun ebp-org-defer-save ()
-  "Schedule ONE idle save for the current buffer."
+  "Schedule ONE idle save for the current buffer.
+`ebp-org-save-guard-function', when non-nil, runs first and may signal."
+  (when ebp-org-save-guard-function
+    (funcall ebp-org-save-guard-function))
   (unless (timerp ebp-org--save-timer)
     (setq ebp-org--save-timer
           (run-with-idle-timer 0.5 nil #'ebp-org--save-now
