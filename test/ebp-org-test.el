@@ -689,6 +689,51 @@ returns the exact revision removed."
                                      #'ebp-org--save-now))
                     timer-idle-list))))))
 
+(ert-deftest ebp-org-save-now-routes-through-the-policy ()
+  "The deferred save's write is `ebp-org-file-save-function'."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (let ((buf (find-file-noselect f)) seen)
+      (with-current-buffer buf (goto-char (point-max)) (insert "x\n"))
+      (let ((ebp-org-file-save-function
+             (lambda (b) (push b seen)
+               (with-current-buffer b (set-buffer-modified-p nil)))))
+        (ebp-org--save-now buf))
+      (should (equal seen (list buf))))))
+
+(ert-deftest ebp-org-default-policy-saves-synchronously ()
+  "The default policy writes now and arms no timer."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (let ((buf (find-file-noselect f)))
+      (with-current-buffer buf
+        (goto-char (point-max)) (insert "* Added\n")
+        (ebp-org--default-file-save buf)
+        (should-not (buffer-modified-p))
+        (should-not (timerp ebp-org--save-timer)))
+      (should (string-search "* Added"
+                             (with-temp-buffer (insert-file-contents f)
+                                               (buffer-string)))))))
+
+(ert-deftest ebp-org-save-now-survives-a-signalling-policy ()
+  "A policy that signals is messaged, never escaping the timer."
+  (ebp-org-test--with-fixture f ebp-org-test--two-headings
+    (let ((buf (find-file-noselect f)))
+      (with-current-buffer buf (goto-char (point-max)) (insert "x\n"))
+      (let ((ebp-org-file-save-function
+             (lambda (_b) (error "Policy refused %s" "secret text")))
+            (inhibit-message t))
+        (ebp-org--save-now buf))
+      (should (buffer-modified-p buf))
+      (with-current-buffer buf (set-buffer-modified-p nil)))))
+
+(ert-deftest ebp-org-cache-invalidate-ignores-namespace ()
+  "Invalidation is whole-table whatever namespace is named."
+  (ebp-org-cache-invalidate)
+  (ebp-org-with-cache 'alpha "k" 1)
+  (ebp-org-with-cache 'beta "k" 2)
+  (should (= 2 (hash-table-count ebp-org--cache)))
+  (ebp-org-cache-invalidate 'alpha)
+  (should (= 0 (hash-table-count ebp-org--cache))))
+
 (ert-deftest ebp-org-defer-save-consults-the-guard ()
   "A guard that signals refuses the save before any timer is armed; one
 that returns lets it through."

@@ -422,7 +422,7 @@ functions above."
   "Build a cache key from NAMESPACE and PARTS.
 Scoped to today's date and the agenda files' stamp, so external edits,
 membership changes, and date roll-over all bust the cache.  NAMESPACE
-stays at `nth 2' — `ebp-org-cache-invalidate' reads it there."
+keeps two callers' identical PARTS apart; invalidation is whole-table."
   (cons (format-time-string "%Y-%m-%d")
         (cons (ebp-org--files-stamp)
               (cons namespace parts))))
@@ -459,20 +459,16 @@ stamp does not — including which function produced it (P1-12)."
            (ebp-org--cache-admit ,k (progn ,@body))
          ,hit))))
 
-(defun ebp-org-cache-invalidate (&optional namespace)
-  "Drop memoised org extractions (and the stat memo).
-With NAMESPACE, only entries under it — the live generation stands, so
-every other namespace keeps its entries.  Keys are collected before
-removal — never `remhash' inside the `maphash' walk."
+(defun ebp-org-cache-invalidate (&optional _namespace)
+  "Drop every memoised org extraction (and the stat memo).
+The argument is accepted for compatibility and ignored.  Namespaced
+invalidation dropped only the entries under one namespace, but callers
+passed the MUTATION's namespace (`org', an app's name), which no cache
+used: an Org write changes facts every namespace's extraction reads,
+so the whole table goes."
   (setq ebp-org--stamp-memo nil)
-  (if namespace
-      (let (dead)
-        (maphash (lambda (k _v)
-                   (when (equal (nth 2 k) namespace) (push k dead)))
-                 ebp-org--cache)
-        (dolist (k dead) (remhash k ebp-org--cache)))
-    (clrhash ebp-org--cache)
-    (setq ebp-org--cache-generation nil)))
+  (clrhash ebp-org--cache)
+  (setq ebp-org--cache-generation nil))
 
 ;;;; Heading references — Emacs-side plists, never on the wire
 
@@ -712,6 +708,8 @@ needs to know that a floor lifecycle exists."
       (remhash key ebp-org--token-sets))))
 ;;;; Mutations
 
+(defvar ebp-org-file-save-function)     ; the one save path, defined below
+
 (defvar-local ebp-org--save-timer nil
   "This buffer's pending deferred save, or nil.  ONE per buffer: the
 poc armed a fresh timer per mutation — ten taps, ten timers, nine
@@ -719,14 +717,18 @@ no-op wakeups all holding the buffer.")
 
 (defun ebp-org--save-now (buf)
   "The deferred save body: save BUF, never prompting, never signalling.
-The stock path PROMPTS in four places — `yes-or-no-p' on supersession
-and on a WRITE-PROTECTED file, `ask-user-about-lock' on a foreign
-lock, and the `require-final-newline' question — and a prompt inside a
-timer wedges a daemon with nobody to answer it.  The two cheap cases
-are answered by inspection below; the save itself runs under
+The write is `ebp-org-file-save-function', the one save path, so a
+deferred save gets whatever the host installed (pre-write transforms,
+after-save hooks).  The stock path PROMPTS in four places —
+`yes-or-no-p' on supersession and on a WRITE-PROTECTED file,
+`ask-user-about-lock' on a foreign lock, and the
+`require-final-newline' question — and a prompt inside a timer wedges a
+daemon with nobody to answer it.  The two cheap cases are answered by
+inspection below; the save itself runs under
 `ebp-org--with-clamped-io', so anything that would still ask
 \(write-protected, final-newline, a drift landing after the modtime
-check) becomes a message-refusal — a signal must never escape a timer."
+check) becomes a message-refusal.  Any other signal from the policy is
+messaged too: a signal must never escape a timer."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (setq ebp-org--save-timer nil)
@@ -739,11 +741,16 @@ check) becomes a message-refusal — a signal must never escape a timer."
             (and lock (not (eq lock t))))
           (message "ebp-org: NOT saving %s — locked by another \
 process" (buffer-name buf)))
-         (t (condition-case nil
-                (ebp-org--with-clamped-io (save-buffer))
+         (t (condition-case err
+                (ebp-org--with-clamped-io
+                  (funcall ebp-org-file-save-function buf))
               (ebp-org-refused
                (message "ebp-org: NOT saving %s — needs interactive \
-input" (buffer-name buf))))))))))
+input" (buffer-name buf)))
+              (error
+               ;; The symbol only: a datum may quote buffer text.
+               (message "ebp-org: NOT saving %s — %s" (buffer-name buf)
+                        (car err))))))))))
 
 (defvar ebp-org-save-guard-function nil
   "Nullary function consulted before `ebp-org-defer-save' arms a save.
@@ -763,7 +770,9 @@ guard is a seam rather than a check of its own.")
                                (current-buffer)))))
 
 (defmacro ebp-org-with-mutation (ref namespace &rest body)
-  "Resolve REF, run BODY at its heading widened, bust NAMESPACE, defer save.
+  "Resolve REF, run BODY at its heading widened, invalidate, defer save.
+NAMESPACE is passed to `ebp-org-cache-invalidate', which ignores it
+\(invalidation is whole-table); it stays for the callers' sake.
 Widening is load-bearing: the poc mutated without it, and a narrowed
 buffer whose restriction excluded the marker silently edited the wrong
 position.  The marker is released after use.  The WHOLE extent —
@@ -891,8 +900,6 @@ save happen once, after the pair has been committed."
       (list :scheduled scheduled :deadline deadline))))
 
 ;;;; Structural outline mutations
-
-(defvar ebp-org-file-save-function)
 
 (defun ebp-org--subtree-bounds-at-point ()
   "Return the current Org subtree's (BEGIN . END) buffer positions."
@@ -2174,18 +2181,27 @@ are not resolved — those cells stay value-editable."
 
 ;;;; The file-save seam
 
-(defun ebp-org--default-file-save (_buffer)
-  "Invalidate the org memo and schedule a save for the current buffer.
-The default `ebp-org-file-save-function'."
+(defun ebp-org--default-file-save (buffer)
+  "Invalidate the org memo and save BUFFER now, never prompting.
+The default `ebp-org-file-save-function'.  Synchronous: the deferred
+save (`ebp-org--save-now') calls this same function, so a default that
+deferred would re-arm its own timer forever.  A would-be prompt
+signals `ebp-org-refused'."
   (ebp-org-cache-invalidate)
-  (ebp-org-defer-save))
+  (with-current-buffer buffer
+    (let ((save-silently t))
+      (ebp-org--with-clamped-io (save-buffer)))))
 
 (defvar ebp-org-file-save-function #'ebp-org--default-file-save
   "Function called, with the just-mutated org BUFFER current, to persist it.
-Apps rebind it to their own mutation tail — e.g. a synchronous save
-plus a note-index refresh — so a generic core mutation keeps their
-memo/index coherent.  (The poc's `file.add-heading' consumer of this
-seam is JA-5's; the seam itself is engine machinery.)")
+THE Org write path: direct mutations call it, and the deferred save
+\(`ebp-org-defer-save') calls it from its timer.  It must save
+synchronously — one that deferred would re-arm its own timer — and may
+signal; the timer catches.  Hosts rebind it to their own mutation
+tail — e.g. a synchronous save plus a note-index refresh — so a generic
+core mutation keeps their memo/index coherent.  (The poc's
+`file.add-heading' consumer of this seam is JA-5's; the seam itself is
+engine machinery.)")
 
 ;;;; The outline model (JA-5a, amendment A3)
 ;; Heading records as pure org data — no nodes, no verbs, no owner.
