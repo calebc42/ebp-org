@@ -1423,6 +1423,35 @@ user data (SPEC 23.3), so no leaf of the tree may ride in the message."
   (should-not (ebp-org-ts-repeater "<2026-08-01 Sat -1d>"))
   (should-not (ebp-org-ts-date nil)))
 
+(ert-deftest ebp-org-ts-parse-fields ()
+  "One parse returns every field of a leading stamp, or nil."
+  (should (equal (ebp-org-ts-parse "<2026-09-05 Sat 09:00-11:00 +1w -2d>")
+                 '(:date "2026-09-05" :time "09:00" :end "11:00"
+                   :repeater "+1w" :warning "-2d" :range-end nil :active t)))
+  ;; Clocks are zero-padded; inactive stamps say so; space is trimmed.
+  (let ((ts (ebp-org-ts-parse "  [2026-10-27 Tue 9:05 .+2d]  ")))
+    (should (equal (plist-get ts :time) "09:05"))
+    (should (equal (plist-get ts :repeater) ".+2d"))
+    (should-not (plist-get ts :active)))
+  (should (equal (plist-get (ebp-org-ts-parse "<2026-10-01 Thu ++1m --3d>")
+                            :warning)
+                 "--3d"))
+  (should (equal (plist-get (ebp-org-ts-parse
+                             "<2026-10-01 Thu>--<2026-10-03 Sat>")
+                            :range-end)
+                 "2026-10-03"))
+  ;; A range end that is not a real day is dropped, not the stamp.
+  (let ((ts (ebp-org-ts-parse "<2026-10-01 Thu>--<2026-02-30 Mon>")))
+    (should (equal (plist-get ts :date) "2026-10-01"))
+    (should-not (plist-get ts :range-end)))
+  ;; Text after the stamp is ignored; text before it is not a stamp.
+  (should (equal (plist-get (ebp-org-ts-parse "<2026-10-01 Thu> later") :date)
+                 "2026-10-01"))
+  (should-not (ebp-org-ts-parse "SCHEDULED: <2026-10-01 Thu>"))
+  (should-not (ebp-org-ts-parse "<2026-02-30 Mon>"))
+  (should-not (ebp-org-ts-parse "no stamp"))
+  (should-not (ebp-org-ts-parse nil)))
+
 (defconst ebp-org-test--tag-group-fixture
   (concat "#+TAGS: { state : hot cold } [ proj : alpha beta ] "
           "[ shared : beta gamma ] { solo duo } [ rx : {V@.+} vee ] loose\n"

@@ -1786,6 +1786,61 @@ Repeaters only — delay cookies (-1d) deliberately do not match."
              (string-match "\\([.+]?\\+[0-9]+[hdwmy]\\)" ts))
     (match-string 1 ts)))
 
+(defconst ebp-org--ts-re
+  (concat "\\`\\([<[]\\)\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)\\([^]>]*\\)[]>]"
+          "\\(?:--[<[]\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)[^]>]*[]>]\\)?")
+  "A leading Org timestamp: bracket, date, the rest, and a range end.")
+
+(defun ebp-org--ts-date-valid (date)
+  "Return ISO DATE when it names a real calendar day, else nil."
+  (and (stringp date)
+       (calendar-date-is-valid-p
+        (list (string-to-number (substring date 5 7))
+              (string-to-number (substring date 8 10))
+              (string-to-number (substring date 0 4))))
+       date))
+
+(defun ebp-org--ts-clock (clock)
+  "Return H:MM or HH:MM CLOCK zero-padded to HH:MM."
+  (if (string-match "\\`\\([0-9]\\{1,2\\}\\):\\([0-9]\\{2\\}\\)\\'" clock)
+      (format "%02d:%s" (string-to-number (match-string 1 clock))
+              (match-string 2 clock))
+    clock))
+
+(defun ebp-org-ts-parse (ts)
+  "Parse the Org timestamp that starts TS, ignoring surrounding space.
+Return nil unless it opens with a real calendar date, else a plist:
+:date the ISO day; :time and :end the HH:MM start and end of a time
+range, zero-padded, or nil; :repeater the cookie as written (\"+1w\",
+\".+2d\", \"++1m\"); :warning the delay or warning cookie (\"-2d\",
+\"--1w\"); :range-end the ISO day ending a <a>--<b> range, or nil;
+:active non-nil for an <active> stamp.  Text after the stamp is ignored."
+  (when (stringp ts)
+    (let ((ts (string-trim ts)))
+      (when (string-match ebp-org--ts-re ts)
+        (let ((active (equal (match-string 1 ts) "<"))
+              (date (match-string 2 ts))
+              (rest (match-string 3 ts))
+              (range-end (match-string 4 ts))
+              time end repeater warning)
+          (dolist (token (split-string rest " " t))
+            (cond
+             ((string-match (concat "\\`\\([0-9]\\{1,2\\}:[0-9]\\{2\\}\\)"
+                                    "\\(?:-\\([0-9]\\{1,2\\}:[0-9]\\{2\\}\\)\\)?\\'")
+                            token)
+              (let ((start (match-string 1 token)) (stop (match-string 2 token)))
+                (setq time (ebp-org--ts-clock start)
+                      end (and stop (ebp-org--ts-clock stop)))))
+             ((string-match-p "\\`\\(?:\\.\\+\\|\\+\\+\\|\\+\\)[0-9]+[hdwmy]\\'" token)
+              (setq repeater token))
+             ((string-match-p "\\`--?[0-9]+[hdwmy]\\'" token)
+              (setq warning token))))
+          (when (ebp-org--ts-date-valid date)
+            (list :date date :time time :end end :repeater repeater
+                  :warning warning
+                  :range-end (ebp-org--ts-date-valid range-end)
+                  :active active)))))))
+
 (defun ebp-org-clocked-in-p (pos)
   "Whether the heading at POS in the current buffer is the clocked task."
   (and (bound-and-true-p org-clock-hd-marker)
