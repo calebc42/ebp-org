@@ -344,12 +344,14 @@ it signals `ebp-org-refused', `ebp-org-unresolved' or
 its truename.  The visit runs under `ebp-org--with-clamped-io', and BODY
 runs with the visiting buffer current, in Org mode, and widened."
   (declare (indent 1) (debug ((symbolp form) body)))
-  (let ((var (car spec)) (file (cadr spec)))
-    `(let ((,var (ebp-org--check-file ,file)))
+  (let ((var (car spec)) (file (cadr spec)) (true (make-symbol "true")))
+    `(let ((,true (ebp-org--check-file ,file)))
        (ebp-org--with-clamped-io
-         (with-current-buffer (find-file-noselect ,var t)
+         (with-current-buffer (find-file-noselect ,true t)
            (unless (derived-mode-p 'org-mode) (org-mode))
-           (org-with-wide-buffer ,@body))))))
+           (org-with-wide-buffer
+            (let ((,var ,true))
+              ,@body)))))))
 
 (defun ebp-org-priority-levels ()
   "The current buffer's priority letters as strings, highest first.

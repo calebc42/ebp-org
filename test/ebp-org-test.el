@@ -2079,7 +2079,22 @@ wholesale, and the live generation is capped."
                         :type 'ebp-org-refused)
         (delete-directory (car ebp-org-roots) t)))
     (should-error (ebp-org-with-file (_true (concat file ".gone")) t)
-                  :type 'ebp-org-unresolved)))
+                  :type 'ebp-org-unresolved)
+    ;; An unused binding compiles clean under warning-as-error, as the
+    ;; consumers' runners compile it.
+    (let* ((dir (make-temp-file "ebp-org-with-file" t))
+           (source (expand-file-name "probe.el" dir))
+           (byte-compile-error-on-warn t)
+           (byte-compile-dest-file-function
+            (lambda (_) (expand-file-name "probe.elc" dir))))
+      (unwind-protect
+          (progn
+            (with-temp-file source
+              (insert ";;; probe.el --- p -*- lexical-binding: t; -*-\n"
+                      "(require 'ebp-org)\n"
+                      "(defun probe (f) (ebp-org-with-file (_true f) t))\n"))
+            (should (byte-compile-file source)))
+        (delete-directory dir t)))))
 
 (ert-deftest ebp-org-priority-levels-follow-the-buffer-range ()
   "Letters run highest first; a broken range answers nil."
