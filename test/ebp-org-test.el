@@ -2049,5 +2049,63 @@ wholesale, and the live generation is capped."
       (should (<= (hash-table-count ebp-org--cache)
                   ebp-org-cache-max)))))
 
+;;;; Org files and vocabulary helpers
+
+(ert-deftest ebp-org-path-p-names-org-files-archives-and-gpg-on-request ()
+  "Org and archive names match case-insensitively; gpg only when asked."
+  (should (ebp-org-path-p "/v/a.org"))
+  (should (ebp-org-path-p "/v/A.ORG"))
+  (should (ebp-org-path-p "/v/a.org_archive"))
+  (should-not (ebp-org-path-p "/v/a.org.gpg"))
+  (should (ebp-org-path-p "/v/a.org.gpg" t))
+  (should-not (ebp-org-path-p "/v/a.org~"))
+  (should-not (ebp-org-path-p "/v/a.txt" t))
+  (should-not (ebp-org-path-p nil)))
+
+(ert-deftest ebp-org-with-file-checks-visits-widens-and-binds-truename ()
+  "The visit is policy-checked, in Org mode and wide; refusals signal."
+  (ebp-org-test--with-fixture file "* One\nBody.\n* Two\n"
+    (with-current-buffer (find-file-noselect file t)
+      (goto-char (point-max))
+      (narrow-to-region (point-min) 3))
+    (should (equal (ebp-org-with-file (true file)
+                     (list true (derived-mode-p 'org-mode)
+                           (buffer-substring-no-properties
+                            (point-min) (point-max))))
+                   (list file 'org-mode "* One\nBody.\n* Two\n")))
+    (let ((ebp-org-roots (list (make-temp-file "ebp-org-elsewhere" t))))
+      (unwind-protect
+          (should-error (ebp-org-with-file (_true file) t)
+                        :type 'ebp-org-refused)
+        (delete-directory (car ebp-org-roots) t)))
+    (should-error (ebp-org-with-file (_true (concat file ".gone")) t)
+                  :type 'ebp-org-unresolved)))
+
+(ert-deftest ebp-org-priority-levels-follow-the-buffer-range ()
+  "Letters run highest first; a broken range answers nil."
+  (with-temp-buffer
+    (let ((org-priority-highest ?A) (org-priority-lowest ?C))
+      (should (equal (ebp-org-priority-levels) '("A" "B" "C"))))
+    (let ((org-priority-highest ?C) (org-priority-lowest ?A))
+      (should-not (ebp-org-priority-levels)))))
+
+(ert-deftest ebp-org-done-keywords-prefer-buffer-then-default-then-config ()
+  "Buffer keywords win, then the global default, then `org-todo-keywords'."
+  (with-temp-buffer
+    (let ((org-todo-keywords '((sequence "TODO(t)" "WAIT(w@/!)" "|"
+                                         "DONE(d)" "KILLED(k@)")
+                               (type "BUG" "FIXED")))
+          (org-done-keywords nil))
+      (should (equal (ebp-org-done-keywords) '("DONE" "KILLED" "FIXED")))
+      (should (ebp-org-done-keyword-p "KILLED"))
+      (should-not (ebp-org-done-keyword-p "WAIT"))
+      (should-not (ebp-org-done-keyword-p nil))
+      (setq-local org-done-keywords '("SHIPPED"))
+      (should (ebp-org-done-keyword-p "SHIPPED"))
+      (should-not (ebp-org-done-keyword-p "DONE"))))
+  (let ((org-todo-keywords '("TODO" "DONE")))
+    (with-temp-buffer
+      (should (equal (ebp-org--configured-done-keywords) '("DONE"))))))
+
 (provide 'ebp-org-test)
 ;;; ebp-org-test.el ends here

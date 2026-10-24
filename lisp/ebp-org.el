@@ -323,6 +323,74 @@ is converted to the same `ebp-org-refused' conditions as engine mutations."
   (ebp-org--with-clamped-io
     (apply function arguments)))
 
+;;;; Org files and vocabulary
+
+(defun ebp-org-path-p (path &optional encrypted)
+  "Non-nil when PATH names an Org file, archives included.
+With ENCRYPTED, a whole-file \".org.gpg\" counts too.  The test is on
+the name alone, case-insensitive; policy is `ebp-org--check-file'."
+  (and (stringp path)
+       (let ((case-fold-search t))
+         (string-match-p (if encrypted
+                             "\\.org\\(?:_archive\\|\\.gpg\\)?\\'"
+                           "\\.org\\(?:_archive\\)?\\'")
+                         path))))
+
+(defmacro ebp-org-with-file (spec &rest body)
+  "Visit an Org file under the root policy and the IO clamp; run BODY.
+SPEC is (VAR FILE).  FILE goes through `ebp-org--check-file' first, so
+it signals `ebp-org-refused', `ebp-org-unresolved' or
+`ebp-org-unavailable' exactly as that checker does, and VAR is bound to
+its truename.  The visit runs under `ebp-org--with-clamped-io', and BODY
+runs with the visiting buffer current, in Org mode, and widened."
+  (declare (indent 1) (debug ((symbolp form) body)))
+  (let ((var (car spec)) (file (cadr spec)))
+    `(let ((,var (ebp-org--check-file ,file)))
+       (ebp-org--with-clamped-io
+         (with-current-buffer (find-file-noselect ,var t)
+           (unless (derived-mode-p 'org-mode) (org-mode))
+           (org-with-wide-buffer ,@body))))))
+
+(defun ebp-org-priority-levels ()
+  "The current buffer's priority letters as strings, highest first.
+Nil when `org-priority-highest' and `org-priority-lowest' do not name a
+range."
+  (let ((hi org-priority-highest) (lo org-priority-lowest))
+    (and (integerp hi) (integerp lo) (<= hi lo)
+         (mapcar #'char-to-string (number-sequence hi lo)))))
+
+(defun ebp-org--configured-done-keywords ()
+  "The done keywords `org-todo-keywords' declares, without fast keys.
+In each sequence the done states follow \"|\", or are the last keyword
+when there is no bar, as Org itself reads them."
+  (let ((specs (if (stringp (car-safe org-todo-keywords))
+                   (list (cons 'sequence org-todo-keywords))
+                 org-todo-keywords))
+        done)
+    (dolist (spec specs)
+      (let* ((words (cl-remove-if-not #'stringp (cdr-safe spec)))
+             (bar (member "|" words))
+             (states (cond (bar (cdr bar))
+                           (words (last words)))))
+        (dolist (state states)
+          (push (replace-regexp-in-string "(.*)\\'" "" state) done))))
+    (nreverse (delete-dups done))))
+
+(defun ebp-org-done-keywords ()
+  "The done keywords in force here.
+The current buffer's `org-done-keywords' when Org has set them (file
+`#+TODO' lines honored), else the global default value, else what
+`org-todo-keywords' declares."
+  (or org-done-keywords
+      (default-value 'org-done-keywords)
+      (ebp-org--configured-done-keywords)))
+
+(defun ebp-org-done-keyword-p (keyword)
+  "Non-nil when KEYWORD is one of `ebp-org-done-keywords'."
+  (and (stringp keyword)
+       (member keyword (ebp-org-done-keywords))
+       t))
+
 ;;;; Cache layer
 
 (defvar ebp-org--cache (make-hash-table :test #'equal)
