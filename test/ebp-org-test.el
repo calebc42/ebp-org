@@ -2080,6 +2080,18 @@ wholesale, and the live generation is capped."
 
 ;;;; Org files and vocabulary helpers
 
+(ert-deftest ebp-org-public-clamp-and-check-file-names ()
+  "Higher layers reach the clamp and the root check by public names.
+The `--' spellings stay the engine's own; both pairs are one definition."
+  (should (eq (indirect-function 'ebp-org--check-file)
+              (indirect-function 'ebp-org-check-file)))
+  (should (macrop 'ebp-org-with-clamped-io))
+  (should (equal (macroexpand-1 '(ebp-org--with-clamped-io (body)))
+                 '(ebp-org-with-clamped-io (body))))
+  ;; The public clamp converts a would-be prompt into the refusal status.
+  (should-error (ebp-org-with-clamped-io (yes-or-no-p "Really? "))
+                :type 'ebp-org-refused))
+
 (ert-deftest ebp-org-path-p-names-org-files-archives-and-gpg-on-request ()
   "Org and archive names match case-insensitively; gpg only when asked."
   (should (ebp-org-path-p "/v/a.org"))

@@ -204,7 +204,7 @@ LOCAL agenda files, already absolute after the same anchoring."
      (cons (expand-file-name org-directory)
            (mapcar #'file-name-directory (ebp-org-agenda-files))))))
 
-(defun ebp-org--check-file (file)
+(defun ebp-org-check-file (file)
   "FILE validated against `ebp-org-roots', as a truename, or signal.
 The guard itself is `ebp-check-path', shared (JA-6 promoted it out);
 this wrapper supplies the org root set and re-signals in the module's
@@ -228,6 +228,11 @@ there):
             (signal 'ebp-org-unavailable (cdr err))
           (signal 'ebp-org-unresolved (list 'file-missing))))
        (_ (signal 'ebp-org-refused (cdr err)))))))
+
+(defalias 'ebp-org--check-file #'ebp-org-check-file
+  "The engine's own spelling of `ebp-org-check-file'.
+Higher layers that visit a file under the root policy use the public
+name (or `ebp-org-with-file'); the `--' form stays for the engine.")
 
 (defun ebp-org-file-allowed-p (file)
   "FILE's truename when it is inside the org roots and readable, else nil.
@@ -278,7 +283,7 @@ errors signal `ebp-org-unavailable'."
 
 ;;;; The D2 IO clamp
 
-(defmacro ebp-org--with-clamped-io (&rest body)
+(defmacro ebp-org-with-clamped-io (&rest body)
   "Run BODY with every interactive file-IO escape clamped (D2).
 Drift and every other would-be question become a STATUS — a
 `ebp-org-refused' signal carrying a one-symbol data list per the
@@ -314,6 +319,13 @@ between the existence filter and the map — the filter/prepare race)."
                 (lambda (&rest _)
                   (signal 'ebp-org-refused (list 'needs-interactive)))))
        ,@body)))
+
+(defmacro ebp-org--with-clamped-io (&rest body)
+  "Run BODY under `ebp-org-with-clamped-io', the engine's own spelling.
+Higher layers use the public name; the `--' form stays for the engine's
+internal extents."
+  (declare (indent 0) (debug t))
+  `(ebp-org-with-clamped-io ,@body))
 
 (defun ebp-org-call-with-clamped-io (function &rest arguments)
   "Call FUNCTION with ARGUMENTS under the engine's no-prompt IO clamp.
