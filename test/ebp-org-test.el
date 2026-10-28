@@ -2163,5 +2163,54 @@ The `--' spellings stay the engine's own; both pairs are one definition."
     (with-temp-buffer
       (should (equal (ebp-org--configured-done-keywords) '("DONE"))))))
 
+(ert-deftest ebp-org-ts-compose-is-the-inverse-of-parse ()
+  "Composing the parsed parts spells the stamp back; junk is refused."
+  (dolist (stamp '("<2026-10-30 Fri>"
+                   "<2026-10-30 Fri 09:00>"
+                   "<2026-10-30 Fri 09:00-10:30 +1w -1d>"
+                   "<2026-10-30 Fri .+2d>"
+                   "<2026-10-30 Fri ++1m --3d>"
+                   "[2026-10-30 Fri 09:00]"))
+    (should (equal (ebp-org-ts-compose (ebp-org-ts-parse stamp)) stamp)))
+  ;; A bare H:MM is zero-padded; a weekday comes from the date.
+  (should (equal (ebp-org-ts-compose '(:date "2026-01-05" :time "9:05"))
+                 "<2026-01-05 Mon 09:05>"))
+  (should-not (ebp-org-ts-compose '(:date "2026-02-30")))
+  (should-not (ebp-org-ts-compose '(:date "2026-10-30" :time "9pm")))
+  (should-not (ebp-org-ts-compose '(:date "2026-10-30" :end "10:00")))
+  (should-not (ebp-org-ts-compose '(:date "2026-10-30" :repeater "+1x")))
+  (should-not (ebp-org-ts-compose '(:date "2026-10-30" :warning "1d"))))
+
+(ert-deftest ebp-org-set-planning-stamp-writes-the-whole-stamp ()
+  "Repeater, warning and end time survive; nil removes; junk is refused."
+  (let* ((dir (make-temp-file "ebp-org-stamp" t))
+         (file (expand-file-name "a.org" dir))
+         (ebp-org-roots (list dir)))
+    (unwind-protect
+        (progn
+          (write-region "* TODO Review\nBody.\n" nil file nil 'silent)
+          (with-current-buffer (find-file-noselect file)
+            (let ((ref (progn (goto-char (point-min)) (ebp-org-ref-at-point))))
+              (ebp-org-set-planning-stamp
+               ref 'test "SCHEDULED" "<2026-10-30 Fri 09:00-10:30 +1w -1d>")
+              (should (equal (org-entry-get (point-min) "SCHEDULED")
+                             "<2026-10-30 Fri 09:00-10:30 +1w -1d>"))
+              (ebp-org-set-planning-stamp
+               ref 'test "DEADLINE" "<2026-11-02 Mon --2d>")
+              (should (equal (org-entry-get (point-min) "DEADLINE")
+                             "<2026-11-02 Mon --2d>"))
+              (should (equal (org-entry-get (point-min) "SCHEDULED")
+                             "<2026-10-30 Fri 09:00-10:30 +1w -1d>"))
+              (should-error (ebp-org-set-planning-stamp
+                             ref 'test "SCHEDULED" "<not a stamp>")
+                            :type 'user-error)
+              (ebp-org-set-planning-stamp ref 'test "SCHEDULED" nil)
+              (should-not (org-entry-get (point-min) "SCHEDULED"))
+              (should (equal (org-entry-get (point-min) "DEADLINE")
+                             "<2026-11-02 Mon --2d>")))
+            (set-buffer-modified-p nil)
+            (kill-buffer)))
+      (delete-directory dir t))))
+
 (provide 'ebp-org-test)
 ;;; ebp-org-test.el ends here

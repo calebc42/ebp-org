@@ -1853,6 +1853,71 @@ range, zero-padded, or nil; :repeater the cookie as written (\"+1w\",
                   :range-end (ebp-org--ts-date-valid range-end)
                   :active active)))))))
 
+(defun ebp-org-ts-compose (parts)
+  "Spell the Org timestamp PARTS describes, the inverse of `ebp-org-ts-parse'.
+PARTS is a plist: :date (ISO, required, must be a real day), optional
+:time and :end (H:MM or HH:MM; :end only with :time), :repeater
+\(\"+1w\", \"++2d\", \".+1m\"), :warning (\"-1d\", \"--2w\"), and :active
+\(default t; nil spells an inactive [stamp]).  The weekday is Org's own
+spelling for the day, so the result reads back through
+`org-parse-time-string'.  Return nil for an invalid date or a malformed
+member: nothing device-shaped reaches a file unchecked."
+  (let* ((date (ebp-org--ts-date-valid (plist-get parts :date)))
+         (time (plist-get parts :time))
+         (end (plist-get parts :end))
+         (repeater (plist-get parts :repeater))
+         (warning (plist-get parts :warning))
+         (active (if (plist-member parts :active) (plist-get parts :active) t))
+         (clock-re "\\`[0-9]\\{1,2\\}:[0-9]\\{2\\}\\'"))
+    (when (and date
+               (or (null time) (and (stringp time) (string-match-p clock-re time)))
+               (or (null end) (and time (stringp end) (string-match-p clock-re end)))
+               (or (null repeater)
+                   (and (stringp repeater)
+                        (string-match-p "\\`\\(?:\\.\\+\\|\\+\\+\\|\\+\\)[0-9]\\{1,4\\}[hdwmy]\\'"
+                                        repeater)))
+               (or (null warning)
+                   (and (stringp warning)
+                        (string-match-p "\\`--?[0-9]\\{1,4\\}[hdwmy]\\'" warning))))
+      (let ((weekday (format-time-string
+                      "%a" (org-time-string-to-time (concat date " 00:00")))))
+        (concat (if active "<" "[")
+                date " " weekday
+                (when time (concat " " (ebp-org--ts-clock time)))
+                (when end (concat "-" (ebp-org--ts-clock end)))
+                (when repeater (concat " " repeater))
+                (when warning (concat " " warning))
+                (if active ">" "]"))))))
+
+(defun ebp-org-set-planning-stamp (ref namespace which stamp)
+  "Replace the WHICH planning stamp at REF with the whole string STAMP.
+WHICH is \"SCHEDULED\" or \"DEADLINE\"; STAMP a complete Org timestamp
+\(`ebp-org-ts-compose'), or nil/empty to remove the stamp.  Org's own
+planning writer places or removes the line and manages the entry, but
+drops repeater and delay cookies and an end time from the string it is
+handed; the stamp it wrote is therefore rewritten whole from STAMP in the
+same mutation.  A STAMP that does not parse is refused with `user-error'
+before anything is touched."
+  (let ((type (pcase (upcase (or which ""))
+                ("SCHEDULED" 'scheduled)
+                ("DEADLINE" 'deadline)
+                (_ (user-error "Unsupported planning type: %s" which))))
+        (parsed (and stamp (not (string-empty-p stamp))
+                     (ebp-org-ts-parse stamp))))
+    (when (and stamp (not (string-empty-p stamp)) (null parsed))
+      (user-error "Malformed planning stamp: %s" stamp))
+    (ebp-org-with-mutation ref namespace
+      (if (null parsed)
+          (org-add-planning-info nil nil type)
+        (org-add-planning-info type (plist-get parsed :date))
+        (org-back-to-heading t)
+        (let ((bound (line-end-position 2))
+              (re (concat (if (eq type 'deadline) org-deadline-string
+                            org-scheduled-string)
+                          "[ \t]*\\(<[^>\n]+>\\)")))
+          (when (re-search-forward re bound t)
+            (replace-match stamp t t nil 1)))))))
+
 (defun ebp-org-clocked-in-p (pos)
   "Whether the heading at POS in the current buffer is the clocked task."
   (and (bound-and-true-p org-clock-hd-marker)
